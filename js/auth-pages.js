@@ -75,23 +75,36 @@
     return String(data?.status || "pending").trim().toLowerCase();
   }
 
+  /*
+   * Create a new approval record.
+   *
+   * Use INSERT rather than UPSERT for a new signup. UPSERT may also
+   * require UPDATE permission if a record with the same user_id exists.
+   */
   async function savePendingAccess(userId, username) {
     const { error } = await client()
       .from("member_access")
-      .upsert(
-        {
-          user_id: userId,
-          username,
-          status: "pending",
-          updated_at: new Date().toISOString()
-        },
-        { onConflict: "user_id" }
-      );
+      .insert({
+        user_id: userId,
+        username: username,
+        status: "pending",
+        updated_at: new Date().toISOString()
+      });
 
     if (error) {
+      if (
+        error.code === "23505" ||
+        /duplicate key|already exists/i.test(error.message || "")
+      ) {
+        throw new Error(
+          "This account or username already has a record. Do not register again. Ask the administrator to check Authentication → Users and member_access."
+        );
+      }
+
       throw new Error(
-        "The authentication account exists, but its approval record could not be saved. Check member_access and its RLS policies. Details: " +
-          error.message
+        "Supabase created the authentication account, but could not save its pending approval record. " +
+        "Check the member_access INSERT policy and confirm it allows auth.uid() = user_id and status = 'pending'. Details: " +
+        error.message
       );
     }
   }
@@ -99,7 +112,9 @@
   async function handleSignup(auth, formData) {
     const username = normalizeUsername(formData.get("username"));
     const password = String(formData.get("password") || "");
-    const confirmPassword = String(formData.get("confirmPassword") || "");
+    const confirmPassword = String(
+      formData.get("confirmPassword") || ""
+    );
 
     if (password.length < 10) {
       throw new Error("Use a password with at least 10 characters.");
@@ -111,30 +126,57 @@
 
     const { data, error } = await auth.auth.signUp({
       email: usernameEmail(username),
-      password,
+      password: password,
       options: {
         data: {
-          username,
+          username: username,
           display_name: username,
           full_name: username
         }
       }
     });
 
-    if (error) throw error;
+    if (error) {
+      const reason = String(error.message || "").toLowerCase();
 
-    if (!data?.user) {
-      throw new Error("Supabase did not return a user. Please try again.");
+      if (
+        reason.includes("already registered") ||
+        reason.includes("already been registered") ||
+        reason.includes("user already exists")
+      ) {
+        throw new Error(
+          "This username may already be registered. Do not keep signing up. Ask the administrator to check the existing account in Supabase Authentication → Users."
+        );
+      }
+
+      throw error;
     }
 
+    if (!data?.user) {
+      throw new Error(
+        "Supabase did not return a user. Please try again."
+      );
+    }
+
+    /*
+     * Without a session, the browser cannot insert the approval record
+     * under the member's authenticated RLS policy.
+     */
     if (!data.session) {
       msg(
-        "The account may already have been created, but no session was started. Do not register again. Check the existing user in Supabase Authentication → Users."
+        "Supabase created or recognized an authentication account, but did not start a session. No approval record was saved. Do not register again. Ask the administrator to check Authentication → Users and email confirmation settings."
       );
       return;
     }
 
-    await savePendingAccess(data.user.id, username);
+    try {
+      await savePendingAccess(data.user.id, username);
+    } catch (error) {
+      await auth.auth.signOut();
+
+      throw error;
+    }
+
     await auth.auth.signOut();
 
     msg(
@@ -157,7 +199,7 @@
     const redirectTo = getResetRedirectUrl();
 
     const { error } = await auth.auth.resetPasswordForEmail(email, {
-      redirectTo
+      redirectTo: redirectTo
     });
 
     if (error) {
@@ -167,7 +209,7 @@
     }
 
     msg(
-      "Reset email requested. Open the newest email and click its reset link in this browser.",
+      "If this email is registered, a password-reset message will be sent. Open the newest email in this browser and use its link.",
       "success"
     );
   }
@@ -182,7 +224,7 @@
 
     const { data, error } = await auth.auth.signInWithPassword({
       email: usernameEmail(username),
-      password
+      password: password
     });
 
     if (error) {
@@ -211,8 +253,8 @@
       await auth.auth.signOut();
 
       throw new Error(
-        "Could not verify your approval status. Check member_access and its SELECT policy. " +
-          (error?.message || "")
+        "Could not verify your approval status. Check the member_access SELECT policy. " +
+        (error?.message || "")
       );
     }
 
@@ -226,7 +268,8 @@
       };
 
       throw new Error(
-        statusMessages[status] || "This account is not approved for access."
+        statusMessages[status] ||
+        "This account is not approved for access."
       );
     }
 
@@ -234,14 +277,16 @@
   }
 
   /*
-   * Recovery links may provide a session in the URL hash.
-   * The password update itself is handled by auth-update-password.html.
+   * Recovery links may contain access_token, refresh_token and type
+   * in the URL hash. Establish the session before allowing a password
+   * update on auth-update-password.html.
    */
   async function initialisePasswordRecovery() {
     const auth = client();
     if (!auth) return;
 
     const page = window.location.pathname.split("/").pop();
+
     if (page !== "auth-update-password.html") return;
 
     const hash = new URLSearchParams(
@@ -336,7 +381,8 @@
     } finally {
       if (button) {
         button.disabled = false;
-        button.textContent = button.dataset.originalText || "Continue";
+        button.textContent =
+          button.dataset.originalText || "Continue";
       }
     }
   }
@@ -352,8 +398,14 @@
     }
 
     initialisePasswordRecovery().catch((error) => {
-      console.error("Password recovery initialisation failed:", error);
-      msg("Could not initialise password recovery. Request a fresh reset email.");
+      console.error(
+        "Password recovery initialisation failed:",
+        error
+      );
+
+      msg(
+        "Could not initialise password recovery. Request a fresh reset email."
+      );
     });
   });
 })();
