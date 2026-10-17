@@ -1,24 +1,29 @@
 
 /*
  * CJ Cruz Trade Tracker — Authentication
+ *
  * Signup: username + password + confirm password
  * Login: username + password
  * Approval: pending / approved / rejected / suspended
+ * Recovery: username-based administrator reset, or email reset
+ *           when the forgot-password form explicitly has an email field.
  *
  * Supabase Auth internally maps usernames to synthetic email addresses.
- * Password resets for these accounts must be administrator-managed.
- * Never expose a Supabase service-role key in browser JavaScript.
+ * Never store plaintext passwords or expose the service-role key.
  */
 
 (function () {
   "use strict";
 
-  const $ = (selector) => document.querySelector(selector);
+  const $ = (selector, root = document) => root.querySelector(selector);
   const client = () => window.CJ_SUPABASE;
 
   function msg(text, type = "error") {
     const el = $("[data-auth-message]");
-    if (!el) return;
+    if (!el) {
+      console[type === "error" ? "error" : "log"](text);
+      return;
+    }
 
     el.textContent = text;
     el.className = "auth-message show " + type;
@@ -48,11 +53,54 @@
       String(window.CJ_AUTH_EMAIL_DOMAIN).trim().toLowerCase();
   }
 
-  function currentPage() {
-    return window.location.pathname
+  /*
+   * Detect the page using both its URL and the actual form fields.
+   * This supports a login page served at the website root.
+   */
+  function detectPage(form) {
+    const path = window.location.pathname
+      .replace(/\/+$/, "")
       .split("/")
-      .filter(Boolean)
-      .pop() || "index.html";
+      .pop()
+      .toLowerCase();
+
+    const has = (name) =>
+      !!$('[name="' + name + '"]', form);
+
+    if (path === "auth-signup.html" ||
+        (has("username") && has("confirmPassword") && has("password"))) {
+      return "signup";
+    }
+
+    if (path === "auth-update-password.html") {
+      return "update-password";
+    }
+
+    if (path === "auth-forgot-password.html") {
+      return "forgot-password";
+    }
+
+    if (path === "auth-login.html") {
+      return "login";
+    }
+
+    /*
+     * The supplied forgot-password HTML uses an email field.
+     * The username recovery form uses a username field instead.
+     */
+    if (has("email") && !has("password")) {
+      return "forgot-password";
+    }
+
+    if (has("username") && has("password")) {
+      return "login";
+    }
+
+    if (has("password") && has("confirmPassword")) {
+      return "update-password";
+    }
+
+    return "unknown";
   }
 
   async function getApprovalStatus(userId) {
@@ -74,18 +122,16 @@
       .from("member_access")
       .insert({
         user_id: userId,
-        username,
+        username: username,
         status: "pending",
         updated_at: new Date().toISOString()
       });
 
     if (error) {
-      if (
-        error.code === "23505" ||
-        /duplicate key|already exists/i.test(error.message || "")
-      ) {
+      if (error.code === "23505" ||
+          /duplicate key|already exists/i.test(error.message || "")) {
         throw new Error(
-          "This account already has an approval record. Ask the administrator to check member_access."
+          "An account or username record already exists. Ask the administrator to check member_access. Do not register again."
         );
       }
 
@@ -99,9 +145,8 @@
   async function handleSignup(auth, formData) {
     const username = normalizeUsername(formData.get("username"));
     const password = String(formData.get("password") || "");
-    const confirmPassword = String(
-      formData.get("confirmPassword") || ""
-    );
+    const confirmPassword =
+      String(formData.get("confirmPassword") || "");
 
     if (password.length < 10) {
       throw new Error("Use a password with at least 10 characters.");
@@ -113,10 +158,10 @@
 
     const { data, error } = await auth.auth.signUp({
       email: usernameEmail(username),
-      password,
+      password: password,
       options: {
         data: {
-          username,
+          username: username,
           display_name: username,
           full_name: username
         }
@@ -132,7 +177,7 @@
         reason.includes("user already exists")
       ) {
         throw new Error(
-          "This username may already exist. Ask the administrator to check Supabase Authentication → Users before trying again."
+          "This username may already be registered. Ask the administrator to check Supabase Authentication → Users before trying again."
         );
       }
 
@@ -145,16 +190,16 @@
 
     if (!data.session) {
       msg(
-        "Supabase created the account but did not start a session, so the pending approval record could not be saved. Do not register again. Ask the administrator to check this account and the Confirm email setting."
+        "The account was created, but Supabase did not start a session. The pending approval record may not have been saved. Do not register again. Ask the administrator to check the existing account and email confirmation settings."
       );
       return;
     }
 
     try {
       await savePendingAccess(data.user.id, username);
-    } catch (e) {
+    } catch (error) {
       await auth.auth.signOut();
-      throw e;
+      throw error;
     }
 
     await auth.auth.signOut();
@@ -179,7 +224,7 @@
 
     const { data, error } = await auth.auth.signInWithPassword({
       email: usernameEmail(username),
-      password
+      password: password
     });
 
     if (error) {
@@ -187,13 +232,13 @@
 
       if (reason.includes("email not confirmed")) {
         throw new Error(
-          "This account is not confirmed in Supabase. Ask the administrator to review the existing account."
+          "This account is not confirmed in Supabase. Ask the administrator to review the existing account. Do not register again."
         );
       }
 
       if (reason.includes("invalid login credentials")) {
         throw new Error(
-          "Username or password is incorrect. Check the exact username and password."
+          "Username or password is incorrect. Check the registered username and password. Remember, usernames are matched without regard to letter case."
         );
       }
 
@@ -204,12 +249,12 @@
 
     try {
       status = await getApprovalStatus(data.user.id);
-    } catch (e) {
+    } catch (error) {
       await auth.auth.signOut();
 
       throw new Error(
-        "Could not verify member approval. Check the member_access SELECT policy. " +
-        (e?.message || "")
+        "Could not verify member approval. Check the member_access table and its SELECT policy. " +
+        (error?.message || "")
       );
     }
 
@@ -223,27 +268,63 @@
       };
 
       throw new Error(
-        messages[status] || "This account is not approved for access."
+        messages[status] ||
+        "This account is not approved for access."
       );
     }
 
     window.location.href = "dashboard.html";
   }
 
-  function handleForgotPassword(formData) {
-    const username = normalizeUsername(formData.get("username"));
+  async function handleForgotPassword(auth, formData) {
+    /*
+     * Username-only recovery: no reset email can be sent because the
+     * synthetic email is hidden from the member.
+     */
+    const usernameValue = formData.get("username");
+
+    if (usernameValue !== null) {
+      const username = normalizeUsername(usernameValue);
+
+      msg(
+        "Password reset for username '" + username +
+        "' is managed by the CJ Cruz administrator. Contact the administrator to verify your identity and reset your password securely. Never share your current password.",
+        "success"
+      );
+      return;
+    }
+
+    /*
+     * Optional email-based recovery for the existing HTML form that
+     * explicitly asks for a registered email address.
+     */
+    const email = String(formData.get("email") || "").trim();
+
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new Error("Enter a valid registered email address.");
+    }
+
+    const { error } = await auth.auth.resetPasswordForEmail(email, {
+      redirectTo: new URL(
+        "auth-update-password.html",
+        window.location.href
+      ).href
+    });
+
+    if (error) {
+      throw new Error("Could not request the reset email: " + error.message);
+    }
 
     msg(
-      "Password resets for username-based accounts are managed by the CJ Cruz administrator. Contact the administrator and verify your identity. Never share your current password.",
+      "If this email is registered, a password-reset message will be sent. Open the newest email and follow its instructions.",
       "success"
     );
   }
 
   async function handleUpdatePassword(auth, formData) {
     const password = String(formData.get("password") || "");
-    const confirmPassword = String(
-      formData.get("confirmPassword") || ""
-    );
+    const confirmPassword =
+      String(formData.get("confirmPassword") || "");
 
     if (password.length < 10) {
       throw new Error("Use a password with at least 10 characters.");
@@ -253,13 +334,33 @@
       throw new Error("The passwords do not match.");
     }
 
-    const { error } = await auth.auth.updateUser({ password });
+    /*
+     * Supabase must have an authenticated recovery session here.
+     * Never allow a normal visitor to change an arbitrary user's password.
+     */
+    const { data: sessionData, error: sessionError } =
+      await auth.auth.getSession();
+
+    if (sessionError) throw sessionError;
+
+    if (!sessionData?.session) {
+      throw new Error(
+        "No valid password-reset session was found. Request a fresh reset link or contact the administrator."
+      );
+    }
+
+    const { error } = await auth.auth.updateUser({
+      password: password
+    });
 
     if (error) throw error;
 
     await auth.auth.signOut();
 
-    msg("Password updated successfully. You can now sign in.", "success");
+    msg(
+      "Password updated successfully. You can now sign in.",
+      "success"
+    );
 
     window.setTimeout(() => {
       window.location.href = "auth-login.html";
@@ -276,9 +377,9 @@
       return;
     }
 
-    const page = currentPage();
+    const page = detectPage(form);
     const formData = new FormData(form);
-    const button = form.querySelector('button[type="submit"]');
+    const button = $('button[type="submit"]', form);
 
     if (button) {
       button.disabled = true;
@@ -288,38 +389,37 @@
 
     try {
       switch (page) {
-        case "auth-signup.html":
+        case "signup":
           await handleSignup(auth, formData);
           break;
 
-        case "auth-login.html":
+        case "login":
           await handleLogin(auth, formData);
           break;
 
-        case "auth-forgot-password.html":
-          handleForgotPassword(formData);
+        case "forgot-password":
+          await handleForgotPassword(auth, formData);
           break;
 
-        case "auth-update-password.html":
+        case "update-password":
           await handleUpdatePassword(auth, formData);
           break;
 
         default:
           throw new Error(
-            "Unsupported authentication page: " + page +
-            ". Check the page filename and script path."
+            "Could not identify this authentication form. Check that it contains data-auth-form and the correct input names."
           );
       }
-    } catch (e) {
+    } catch (error) {
       const message = String(
-        e?.message || "Something went wrong. Please try again."
+        error?.message || "Something went wrong. Please try again."
       );
 
       if (
         /email signups are disabled|signups not allowed|email provider.*disabled/i.test(message)
       ) {
         msg(
-          "Enable the Email provider in Supabase → Authentication → Sign In / Providers. Keep Confirm email OFF for this username-based setup."
+          "Enable the Email provider in Supabase → Authentication → Sign In / Providers. For username-based signup, turn Confirm email OFF."
         );
       } else {
         msg(message);
@@ -333,14 +433,22 @@
     }
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
-    const form = $("[data-auth-form]");
+  document.addEventListener("DOMContentLoaded", function () {
+    const forms = document.querySelectorAll("[data-auth-form]");
 
-    if (!form) return;
+    forms.forEach(function (form) {
+      /*
+       * Prevent accidental duplicate listeners if this script is
+       * included more than once.
+       */
+      if (form.dataset.authHandlerAttached === "true") return;
 
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      submit(form);
+      form.dataset.authHandlerAttached = "true";
+
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        submit(form);
+      });
     });
   });
 })();
