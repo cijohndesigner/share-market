@@ -1,14 +1,12 @@
 
 /*
  * CJ Cruz Trade Tracker — Authentication
- *
  * Signup: username + password + confirm password
  * Login: username + password
  * Approval: pending / approved / rejected / suspended
- * Password recovery: registered email
  *
- * Supabase Auth handles passwords. Never store plain-text passwords
- * in database tables or expose the Supabase service-role key.
+ * Supabase Auth uses a hidden synthetic email internally.
+ * Username-based password resets must be administrator-managed.
  */
 
 (function () {
@@ -48,21 +46,6 @@
     return username + "@" + window.CJ_AUTH_EMAIL_DOMAIN;
   }
 
-  function getResetRedirectUrl() {
-    const isLocal =
-      window.location.hostname === "localhost" ||
-      window.location.hostname === "127.0.0.1";
-
-    if (isLocal) {
-      return "http://localhost:8000/auth-update-password.html";
-    }
-
-    return new URL(
-      "auth-update-password.html",
-      window.location.href
-    ).href;
-  }
-
   async function getApprovalStatus(userId) {
     const { data, error } = await client()
       .from("member_access")
@@ -72,21 +55,17 @@
 
     if (error) throw error;
 
-    return String(data?.status || "pending").trim().toLowerCase();
+    return String(data?.status || "pending")
+      .trim()
+      .toLowerCase();
   }
 
-  /*
-   * Create a new approval record.
-   *
-   * Use INSERT rather than UPSERT for a new signup. UPSERT may also
-   * require UPDATE permission if a record with the same user_id exists.
-   */
   async function savePendingAccess(userId, username) {
     const { error } = await client()
       .from("member_access")
       .insert({
         user_id: userId,
-        username: username,
+        username,
         status: "pending",
         updated_at: new Date().toISOString()
       });
@@ -97,13 +76,12 @@
         /duplicate key|already exists/i.test(error.message || "")
       ) {
         throw new Error(
-          "This account or username already has a record. Do not register again. Ask the administrator to check Authentication → Users and member_access."
+          "An account or username record already exists. Ask the administrator to check member_access."
         );
       }
 
       throw new Error(
-        "Supabase created the authentication account, but could not save its pending approval record. " +
-        "Check the member_access INSERT policy and confirm it allows auth.uid() = user_id and status = 'pending'. Details: " +
+        "The authentication account was created, but its approval record could not be saved. Check the member_access INSERT policy. Details: " +
         error.message
       );
     }
@@ -126,10 +104,10 @@
 
     const { data, error } = await auth.auth.signUp({
       email: usernameEmail(username),
-      password: password,
+      password,
       options: {
         data: {
-          username: username,
+          username,
           display_name: username,
           full_name: username
         }
@@ -145,7 +123,7 @@
         reason.includes("user already exists")
       ) {
         throw new Error(
-          "This username may already be registered. Do not keep signing up. Ask the administrator to check the existing account in Supabase Authentication → Users."
+          "This username may already exist. Ask the administrator to check Authentication → Users before registering again."
         );
       }
 
@@ -153,28 +131,21 @@
     }
 
     if (!data?.user) {
-      throw new Error(
-        "Supabase did not return a user. Please try again."
-      );
+      throw new Error("Supabase did not return a user. Please try again.");
     }
 
-    /*
-     * Without a session, the browser cannot insert the approval record
-     * under the member's authenticated RLS policy.
-     */
     if (!data.session) {
       msg(
-        "Supabase created or recognized an authentication account, but did not start a session. No approval record was saved. Do not register again. Ask the administrator to check Authentication → Users and email confirmation settings."
+        "Supabase did not start a session, so the pending approval record was not saved. Do not register again. Ask the administrator to check this account and the Confirm email setting."
       );
       return;
     }
 
     try {
       await savePendingAccess(data.user.id, username);
-    } catch (error) {
+    } catch (saveError) {
       await auth.auth.signOut();
-
-      throw error;
+      throw saveError;
     }
 
     await auth.auth.signOut();
@@ -189,31 +160,6 @@
     }, 1800);
   }
 
-  async function handleForgotPassword(auth, formData) {
-    const email = String(formData.get("email") || "").trim();
-
-    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      throw new Error("Enter a valid registered email address.");
-    }
-
-    const redirectTo = getResetRedirectUrl();
-
-    const { error } = await auth.auth.resetPasswordForEmail(email, {
-      redirectTo: redirectTo
-    });
-
-    if (error) {
-      throw new Error(
-        "Could not request the reset email: " + error.message
-      );
-    }
-
-    msg(
-      "If this email is registered, a password-reset message will be sent. Open the newest email in this browser and use its link.",
-      "success"
-    );
-  }
-
   async function handleLogin(auth, formData) {
     const username = normalizeUsername(formData.get("username"));
     const password = String(formData.get("password") || "");
@@ -224,7 +170,7 @@
 
     const { data, error } = await auth.auth.signInWithPassword({
       email: usernameEmail(username),
-      password: password
+      password
     });
 
     if (error) {
@@ -232,7 +178,7 @@
 
       if (reason.includes("email not confirmed")) {
         throw new Error(
-          "This account is not confirmed. Ask the administrator to review the existing account in Supabase Authentication → Users."
+          "This account is not confirmed in Supabase. Ask the administrator to review the existing account."
         );
       }
 
@@ -249,12 +195,12 @@
 
     try {
       status = await getApprovalStatus(data.user.id);
-    } catch (error) {
+    } catch (statusError) {
       await auth.auth.signOut();
 
       throw new Error(
         "Could not verify your approval status. Check the member_access SELECT policy. " +
-        (error?.message || "")
+        (statusError?.message || "")
       );
     }
 
@@ -263,7 +209,7 @@
 
       const statusMessages = {
         pending: "Your account is waiting for administrator approval.",
-        rejected: "Your access request was rejected. Contact the administrator if needed.",
+        rejected: "Your access request was rejected. Contact the administrator.",
         suspended: "Your account is suspended. Contact the administrator."
       };
 
@@ -276,51 +222,46 @@
     window.location.href = "dashboard.html";
   }
 
-  /*
-   * Recovery links may contain access_token, refresh_token and type
-   * in the URL hash. Establish the session before allowing a password
-   * update on auth-update-password.html.
-   */
-  async function initialisePasswordRecovery() {
-    const auth = client();
-    if (!auth) return;
+  function handleForgotPassword(formData) {
+    const username = String(formData.get("username") || "")
+      .trim()
+      .toLowerCase();
 
-    const page = window.location.pathname.split("/").pop();
+    if (!username) {
+      throw new Error("Enter your username.");
+    }
 
-    if (page !== "auth-update-password.html") return;
+    msg(
+      "Password resets are managed by the CJ Cruz administrator. Contact the administrator with your username and verify your identity. Never share your current password.",
+      "success"
+    );
+  }
 
-    const hash = new URLSearchParams(
-      window.location.hash.replace(/^#/, "")
+  async function handleUpdatePassword(auth, formData) {
+    const password = String(formData.get("password") || "");
+    const confirmPassword = String(
+      formData.get("confirmPassword") || ""
     );
 
-    const accessToken = hash.get("access_token");
-    const refreshToken = hash.get("refresh_token");
-    const type = hash.get("type");
-
-    if (type === "recovery" && accessToken && refreshToken) {
-      const { error } = await auth.auth.setSession({
-        access_token: accessToken,
-        refresh_token: refreshToken
-      });
-
-      if (error) {
-        msg(
-          "The recovery link could not be validated. Request a fresh reset email."
-        );
-        return;
-      }
-
-      window.history.replaceState(
-        null,
-        "",
-        window.location.pathname + window.location.search
-      );
-
-      msg(
-        "Recovery link verified. Enter your new password on this page.",
-        "success"
-      );
+    if (password.length < 10) {
+      throw new Error("Use a password with at least 10 characters.");
     }
+
+    if (password !== confirmPassword) {
+      throw new Error("The passwords do not match.");
+    }
+
+    const { error } = await auth.auth.updateUser({ password });
+
+    if (error) throw error;
+
+    await auth.auth.signOut();
+
+    msg("Password updated successfully. You can now sign in.", "success");
+
+    window.setTimeout(() => {
+      window.location.href = "auth-login.html";
+    }, 1800);
   }
 
   async function submit(form) {
@@ -346,34 +287,25 @@
     try {
       if (page === "auth-signup.html") {
         await handleSignup(auth, formData);
-        return;
-      }
-
-      if (page === "auth-forgot-password.html") {
-        await handleForgotPassword(auth, formData);
-        return;
-      }
-
-      if (page === "auth-login.html") {
+      } else if (page === "auth-login.html") {
         await handleLogin(auth, formData);
-        return;
+      } else if (page === "auth-forgot-password.html") {
+        handleForgotPassword(formData);
+      } else if (page === "auth-update-password.html") {
+        await handleUpdatePassword(auth, formData);
+      } else {
+        msg("Unsupported authentication page. Check the page filename.");
       }
-
-      msg(
-        "This authentication page is not supported by this handler. Check the page filename."
-      );
     } catch (error) {
       const message = String(
         error?.message || "Something went wrong. Please try again."
       );
 
       if (
-        /email signups are disabled|signups not allowed|email provider.*disabled/i.test(
-          message
-        )
+        /email signups are disabled|signups not allowed|email provider.*disabled/i.test(message)
       ) {
         msg(
-          "Enable the Email provider in Supabase → Authentication → Sign In / Providers."
+          "Enable the Email provider in Supabase → Authentication → Sign In / Providers. Keep Confirm email OFF for this setup."
         );
       } else {
         msg(message);
@@ -396,16 +328,5 @@
         submit(form);
       });
     }
-
-    initialisePasswordRecovery().catch((error) => {
-      console.error(
-        "Password recovery initialisation failed:",
-        error
-      );
-
-      msg(
-        "Could not initialise password recovery. Request a fresh reset email."
-      );
-    });
   });
 })();
