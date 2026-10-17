@@ -5,8 +5,9 @@
  * Login: username + password
  * Approval: pending / approved / rejected / suspended
  *
- * Supabase Auth uses a hidden synthetic email internally.
- * Username-based password resets must be administrator-managed.
+ * Supabase Auth internally maps usernames to synthetic email addresses.
+ * Password resets for these accounts must be administrator-managed.
+ * Never expose a Supabase service-role key in browser JavaScript.
  */
 
 (function () {
@@ -16,12 +17,12 @@
   const client = () => window.CJ_SUPABASE;
 
   function msg(text, type = "error") {
-    const element = $("[data-auth-message]");
-    if (!element) return;
+    const el = $("[data-auth-message]");
+    if (!el) return;
 
-    element.textContent = text;
-    element.className = "auth-message show " + type;
-    element.setAttribute("role", "status");
+    el.textContent = text;
+    el.className = "auth-message show " + type;
+    el.setAttribute("role", "status");
   }
 
   function normalizeUsername(value) {
@@ -43,7 +44,15 @@
   }
 
   function usernameEmail(username) {
-    return username + "@" + window.CJ_AUTH_EMAIL_DOMAIN;
+    return username + "@" +
+      String(window.CJ_AUTH_EMAIL_DOMAIN).trim().toLowerCase();
+  }
+
+  function currentPage() {
+    return window.location.pathname
+      .split("/")
+      .filter(Boolean)
+      .pop() || "index.html";
   }
 
   async function getApprovalStatus(userId) {
@@ -76,12 +85,12 @@
         /duplicate key|already exists/i.test(error.message || "")
       ) {
         throw new Error(
-          "An account or username record already exists. Ask the administrator to check member_access."
+          "This account already has an approval record. Ask the administrator to check member_access."
         );
       }
 
       throw new Error(
-        "The authentication account was created, but its approval record could not be saved. Check the member_access INSERT policy. Details: " +
+        "The authentication account was created, but its pending approval record could not be saved. Check the member_access INSERT policy. Details: " +
         error.message
       );
     }
@@ -123,7 +132,7 @@
         reason.includes("user already exists")
       ) {
         throw new Error(
-          "This username may already exist. Ask the administrator to check Authentication → Users before registering again."
+          "This username may already exist. Ask the administrator to check Supabase Authentication → Users before trying again."
         );
       }
 
@@ -136,16 +145,16 @@
 
     if (!data.session) {
       msg(
-        "Supabase did not start a session, so the pending approval record was not saved. Do not register again. Ask the administrator to check this account and the Confirm email setting."
+        "Supabase created the account but did not start a session, so the pending approval record could not be saved. Do not register again. Ask the administrator to check this account and the Confirm email setting."
       );
       return;
     }
 
     try {
       await savePendingAccess(data.user.id, username);
-    } catch (saveError) {
+    } catch (e) {
       await auth.auth.signOut();
-      throw saveError;
+      throw e;
     }
 
     await auth.auth.signOut();
@@ -184,7 +193,7 @@
 
       if (reason.includes("invalid login credentials")) {
         throw new Error(
-          "Username or password is incorrect. Check the registered username and password."
+          "Username or password is incorrect. Check the exact username and password."
         );
       }
 
@@ -195,27 +204,26 @@
 
     try {
       status = await getApprovalStatus(data.user.id);
-    } catch (statusError) {
+    } catch (e) {
       await auth.auth.signOut();
 
       throw new Error(
-        "Could not verify your approval status. Check the member_access SELECT policy. " +
-        (statusError?.message || "")
+        "Could not verify member approval. Check the member_access SELECT policy. " +
+        (e?.message || "")
       );
     }
 
     if (status !== "approved") {
       await auth.auth.signOut();
 
-      const statusMessages = {
+      const messages = {
         pending: "Your account is waiting for administrator approval.",
         rejected: "Your access request was rejected. Contact the administrator.",
         suspended: "Your account is suspended. Contact the administrator."
       };
 
       throw new Error(
-        statusMessages[status] ||
-        "This account is not approved for access."
+        messages[status] || "This account is not approved for access."
       );
     }
 
@@ -223,16 +231,10 @@
   }
 
   function handleForgotPassword(formData) {
-    const username = String(formData.get("username") || "")
-      .trim()
-      .toLowerCase();
-
-    if (!username) {
-      throw new Error("Enter your username.");
-    }
+    const username = normalizeUsername(formData.get("username"));
 
     msg(
-      "Password resets are managed by the CJ Cruz administrator. Contact the administrator with your username and verify your identity. Never share your current password.",
+      "Password resets for username-based accounts are managed by the CJ Cruz administrator. Contact the administrator and verify your identity. Never share your current password.",
       "success"
     );
   }
@@ -274,7 +276,7 @@
       return;
     }
 
-    const page = window.location.pathname.split("/").pop();
+    const page = currentPage();
     const formData = new FormData(form);
     const button = form.querySelector('button[type="submit"]');
 
@@ -285,27 +287,39 @@
     }
 
     try {
-      if (page === "auth-signup.html") {
-        await handleSignup(auth, formData);
-      } else if (page === "auth-login.html") {
-        await handleLogin(auth, formData);
-      } else if (page === "auth-forgot-password.html") {
-        handleForgotPassword(formData);
-      } else if (page === "auth-update-password.html") {
-        await handleUpdatePassword(auth, formData);
-      } else {
-        msg("Unsupported authentication page. Check the page filename.");
+      switch (page) {
+        case "auth-signup.html":
+          await handleSignup(auth, formData);
+          break;
+
+        case "auth-login.html":
+          await handleLogin(auth, formData);
+          break;
+
+        case "auth-forgot-password.html":
+          handleForgotPassword(formData);
+          break;
+
+        case "auth-update-password.html":
+          await handleUpdatePassword(auth, formData);
+          break;
+
+        default:
+          throw new Error(
+            "Unsupported authentication page: " + page +
+            ". Check the page filename and script path."
+          );
       }
-    } catch (error) {
+    } catch (e) {
       const message = String(
-        error?.message || "Something went wrong. Please try again."
+        e?.message || "Something went wrong. Please try again."
       );
 
       if (
         /email signups are disabled|signups not allowed|email provider.*disabled/i.test(message)
       ) {
         msg(
-          "Enable the Email provider in Supabase → Authentication → Sign In / Providers. Keep Confirm email OFF for this setup."
+          "Enable the Email provider in Supabase → Authentication → Sign In / Providers. Keep Confirm email OFF for this username-based setup."
         );
       } else {
         msg(message);
@@ -322,11 +336,11 @@
   document.addEventListener("DOMContentLoaded", () => {
     const form = $("[data-auth-form]");
 
-    if (form) {
-      form.addEventListener("submit", (event) => {
-        event.preventDefault();
-        submit(form);
-      });
-    }
+    if (!form) return;
+
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submit(form);
+    });
   });
 })();
